@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/components/sidebar.tsx","./src/hooks/useasteriskphone.ts","./src/pages/calllogs.tsx","./src/pages/contacts.tsx","./src/pages/softphone.tsx","./src/types/jssip.d.ts","./src/types/sip.ts"],"version":"5.9.3"}
