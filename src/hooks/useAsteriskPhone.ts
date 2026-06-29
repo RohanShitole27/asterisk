@@ -13,10 +13,8 @@ type RTCSession = JsSipRTCSession & {
 
 export type ConferenceStatus = 'none' | 'held' | 'ringing2' | 'answered2' | 'conference';
 
-const ext           = new URLSearchParams(window.location.search).get('ext') ?? '1001';
 const ASTERISK_HOST = '127.0.0.1';
 const WSS_URL       = `wss://${ASTERISK_HOST}:8089/ws`;
-const SIP_URI       = `sip:${ext}@${ASTERISK_HOST}`;
 const SIP_PASSWORD  = '1234';
 
 // Uncomment to enable verbose JsSIP logging for debugging:
@@ -24,7 +22,11 @@ const SIP_PASSWORD  = '1234';
 // debug.enable('JsSIP:*');
 
 // ── Hook ───────────────────────────────────────────────────────────────────────
-export function useAsteriskPhone() {
+// `extension` comes from the logged-in user's assigned extension (see useAuth) —
+// no longer read from a URL param, since identity now comes from the session.
+// `enabled` lets a role opt out of SIP entirely (distinct from "no extension
+// assigned", which is a misconfiguration; enabled=false means it's intentional).
+export function useAsteriskPhone(extension: string | null, enabled: boolean = true) {
   const [state, setState] = useState<PhoneState>({
     registered:    false,
     registering:   false,
@@ -37,14 +39,21 @@ export function useAsteriskPhone() {
 
   const [callLogs, setCallLogs] = useState<CallLogEntry[]>([]);
 
-  // Load call logs from DB on mount
+  // Load call logs from DB on mount, then keep polling — a manager/admin's
+  // dashboard needs to see other people's calls as they happen, not just
+  // calls made in this exact browser tab (which update locally via addCallLog).
   useEffect(() => {
-    fetch('/api/call-logs?source=asterisk')
-      .then((r) => r.json())
-      .then((rows: Array<{ id: string; direction: 'inbound' | 'outbound'; remoteIdentity: string; startTime: string; endTime: string | null; duration: number | null; status: 'answered' | 'missed' | 'failed'; recordingSid?: string | null; sipRecordingFile?: string | null }>) =>
-        setCallLogs(rows.map((r) => ({ ...r, startTime: new Date(r.startTime), endTime: r.endTime ? new Date(r.endTime) : null })))
-      )
-      .catch(() => {}); // fail silently — UI still works without logs
+    const load = () => {
+      fetch('/api/call-logs?source=asterisk', { credentials: 'include' })
+        .then((r) => (r.ok ? r.json() : []))
+        .then((rows: Array<{ id: string; direction: 'inbound' | 'outbound'; remoteIdentity: string; startTime: string; endTime: string | null; duration: number | null; status: 'answered' | 'missed' | 'failed'; recordingSid?: string | null; sipRecordingFile?: string | null; extension?: string | null }>) =>
+          setCallLogs(rows.map((r) => ({ ...r, startTime: new Date(r.startTime), endTime: r.endTime ? new Date(r.endTime) : null })))
+        )
+        .catch(() => {}); // fail silently — UI still works without logs
+    };
+    load();
+    const id = setInterval(load, 8_000);
+    return () => clearInterval(id);
   }, []);
 
   // ── Conference state ──────────────────────────────────────────────────────
@@ -115,6 +124,7 @@ export function useAsteriskPhone() {
         ? Math.round((endTime.getTime() - startTime.getTime()) / 1000)
         : null,
       status,
+      extension,
     };
     setCallLogs((prev) => [entry, ...prev]);
     fetch('/api/call-logs', {
@@ -122,7 +132,7 @@ export function useAsteriskPhone() {
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ ...entry, source: 'asterisk' }),
     }).catch((err) => console.error('Failed to save call log:', err));
-  }, []);
+  }, [extension]);
 
   const resetConferenceState = useCallback(() => {
     secondSessionRef.current  = null;
@@ -199,10 +209,15 @@ export function useAsteriskPhone() {
   }, [addCallLog, attachRemoteStream, markCallAnswered, resetCallState]);
 
   useEffect(() => {
+    if (!enabled) return; // this role intentionally never registers SIP
+    if (!extension) {
+      setState((p) => ({ ...p, error: 'No extension assigned to your account — ask an admin to assign one' }));
+      return;
+    }
     const socket = new WebSocketInterface(WSS_URL);
     const ua = new UA({
       sockets:          [socket],
-      uri:              SIP_URI,
+      uri:              `sip:${extension}@${ASTERISK_HOST}`,
       password:         SIP_PASSWORD,
       register:         true,
       register_expires: 300,
@@ -255,7 +270,7 @@ export function useAsteriskPhone() {
       ua.stop();
       uaRef.current = null;
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [extension, enabled]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const makeCall = useCallback((number: string) => {
     const ua = uaRef.current;

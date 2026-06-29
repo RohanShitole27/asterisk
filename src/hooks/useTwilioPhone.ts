@@ -26,7 +26,12 @@ export interface TwilioPhoneState {
   error:          string | null;
 }
 
-export function useTwilioPhone() {
+// `enabled` lets a role opt out of PSTN entirely — when false, no token is
+// fetched and no Device is ever created (used to keep Admin SIP-only).
+// `agentExtension` is stamped onto locally-created log entries so the
+// Dashboard/CallLogs per-agent filter can match them immediately, without
+// waiting for the next server poll to fill it in.
+export function useTwilioPhone(enabled: boolean = true, agentExtension: string | null = null) {
   const [state, setState] = useState<TwilioPhoneState>({
     ready:          false,
     callStatus:     'idle',
@@ -38,14 +43,21 @@ export function useTwilioPhone() {
   const [callLogs, setCallLogs] = useState<CallLogEntry[]>([]);
   const activeCallSidRef = useRef<string | null>(null);
 
-  // Load call logs from DB on mount
+  // Load call logs from DB on mount, then keep polling — a manager/admin's
+  // dashboard needs to see other people's calls as they happen, not just
+  // calls made in this exact browser tab (which update locally via addCallLog).
   useEffect(() => {
-    fetch('/api/call-logs?source=twilio')
-      .then((r) => r.json())
-      .then((rows: Array<{ id: string; direction: 'inbound' | 'outbound'; remoteIdentity: string; startTime: string; endTime: string | null; duration: number | null; status: 'answered' | 'missed' | 'failed'; recordingSid?: string | null; sipRecordingFile?: string | null }>) =>
-        setCallLogs(rows.map((r) => ({ ...r, startTime: new Date(r.startTime), endTime: r.endTime ? new Date(r.endTime) : null })))
-      )
-      .catch(() => {});
+    const load = () => {
+      fetch('/api/call-logs?source=twilio', { credentials: 'include' })
+        .then((r) => (r.ok ? r.json() : []))
+        .then((rows: Array<{ id: string; direction: 'inbound' | 'outbound'; remoteIdentity: string; startTime: string; endTime: string | null; duration: number | null; status: 'answered' | 'missed' | 'failed'; recordingSid?: string | null; sipRecordingFile?: string | null; extension?: string | null }>) =>
+          setCallLogs(rows.map((r) => ({ ...r, startTime: new Date(r.startTime), endTime: r.endTime ? new Date(r.endTime) : null })))
+        )
+        .catch(() => {});
+    };
+    load();
+    const id = setInterval(load, 8_000);
+    return () => clearInterval(id);
   }, []);
 
   const deviceRef  = useRef<Device | null>(null);
@@ -89,6 +101,7 @@ export function useTwilioPhone() {
         ? Math.round((endTime.getTime() - startTime.getTime()) / 1000)
         : null,
       status,
+      extension: agentExtension,
     };
     setCallLogs((prev) => [entry, ...prev]);
     fetch('/api/call-logs', {
@@ -96,7 +109,7 @@ export function useTwilioPhone() {
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ ...entry, source: 'twilio' }),
     }).catch((err) => console.error('Failed to save call log:', err));
-  }, []);
+  }, [agentExtension]);
 
   // Wire event listeners on a Call object
   const wireCall = useCallback((call: Call, direction: 'inbound' | 'outbound') => {
@@ -157,6 +170,8 @@ export function useTwilioPhone() {
 
   // ── Token fetch + Device init ───────────────────────────────────────────────
   useEffect(() => {
+    if (!enabled) return; // this role intentionally never registers a Twilio Device
+
     let device: Device | null = null;
     // Guard against React StrictMode double-mount: if this effect instance has
     // been cleaned up, the incoming handler must not process new calls.
@@ -164,8 +179,8 @@ export function useTwilioPhone() {
 
     async function init() {
       try {
-        const ext = new URLSearchParams(window.location.search).get('ext') ?? '1001';
-        const res = await fetch(`/api/twilio/token?ext=${encodeURIComponent(ext)}`);
+        // Identity is derived server-side from the logged-in session — no URL param needed.
+        const res = await fetch('/api/twilio/token', { credentials: 'include' });
         if (!res.ok) {
           const { error } = await res.json().catch(() => ({ error: res.statusText }));
           setErr(`Token error: ${error}`);
@@ -227,7 +242,7 @@ export function useTwilioPhone() {
       device?.destroy();
       deviceRef.current = null;
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [enabled]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Controls ────────────────────────────────────────────────────────────────
 

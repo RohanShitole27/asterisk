@@ -1,5 +1,5 @@
-import { useState, useMemo } from 'react';
-import type { CallLogEntry, IvrEvent } from '../types/sip';
+import { useState, useMemo, useEffect } from 'react';
+import type { CallLogEntry, IvrEvent, User } from '../types/sip';
 import { useContacts } from '../hooks/useContacts';
 
 function fmt(sec: number | null) {
@@ -45,23 +45,40 @@ const EVENT_LABEL: Record<string, { label: string; color: string }> = {
   caller_hangup:          { label: 'Hung Up',         color: '#64748b' },
 };
 
+/** Returns who actually dialed whom, regardless of inbound/outbound framing. */
+function fromTo(log: CallLogEntry, agentName: string, remoteDisplay: string): { from: string; to: string } {
+  return log.direction === 'outbound'
+    ? { from: agentName, to: remoteDisplay }
+    : { from: remoteDisplay, to: agentName };
+}
+
 // ── Detail drawer ─────────────────────────────────────────────────────────────
-function DetailDrawer({ log, onClose, lookupName }: { log: CallLogEntry; onClose: () => void; lookupName: (n: string) => string | null }) {
+function DetailDrawer({ log, onClose, lookupName, agentName }: { log: CallLogEntry; onClose: () => void; lookupName: (n: string) => string | null; agentName: string }) {
   const [events,  setEvents]  = useState<IvrEvent[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [sipFile, setSipFile] = useState<string | null>(log.sipRecordingFile ?? null);
+  // Twilio recordings finish processing asynchronously after the call ends —
+  // the in-memory log entry from the moment the call hung up may predate that,
+  // so refetch this single row to pick up a recordingSid that's since arrived.
+  const [recordingSid, setRecordingSid] = useState<string | null>(log.recordingSid ?? null);
 
   const load = async () => {
     setLoading(true);
     try {
-      const [ivrRes, recRes] = await Promise.all([
+      const [ivrRes, freshRes, recRes] = await Promise.all([
         fetch(`/api/ivr-events?call_sid=${encodeURIComponent(log.id)}`),
+        fetch(`/api/call-logs/${encodeURIComponent(log.id)}`),
         // Only fetch SIP recordings list for SIP (non-Twilio) calls without a known file
         (!log.recordingSid && !log.sipRecordingFile)
           ? fetch('/api/sip-recordings')
           : Promise.resolve(null),
       ]);
       if (ivrRes.ok) setEvents(await ivrRes.json());
+      if (freshRes.ok) {
+        const fresh: CallLogEntry = await freshRes.json();
+        if (fresh.recordingSid)     setRecordingSid(fresh.recordingSid);
+        if (fresh.sipRecordingFile) setSipFile(fresh.sipRecordingFile);
+      }
       if (recRes && recRes.ok) {
         const files: Array<{ filename: string; createdAt: string; caller: string | null; callee: string | null }> = await recRes.json();
         const logTime = log.startTime.getTime();
@@ -87,6 +104,9 @@ function DetailDrawer({ log, onClose, lookupName }: { log: CallLogEntry; onClose
     ? (IVR_PATH[log.ivrOption] ?? `Option ${log.ivrOption}`)
     : null;
 
+  const remoteDisplay = lookupName(extractNumber(log.remoteIdentity)) ?? extractNumber(log.remoteIdentity);
+  const { from, to } = fromTo(log, agentName, remoteDisplay);
+
   return (
     <div style={{
       position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)',
@@ -105,8 +125,10 @@ function DetailDrawer({ log, onClose, lookupName }: { log: CallLogEntry; onClose
         {/* Header */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
           <div>
-            <div style={{ fontWeight: 700, fontSize: 16, color: 'var(--text-primary)', marginBottom: 2 }}>
-              {lookupName(extractNumber(log.remoteIdentity)) ?? extractNumber(log.remoteIdentity)}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 700, fontSize: 16, color: 'var(--text-primary)', marginBottom: 2 }}>
+              <span>{from}</span>
+              <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}>→</span>
+              <span>{to}</span>
             </div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
               {log.direction === 'inbound' ? '↗ Inbound' : '↙ Outbound'} · {fmtTime(log.startTime)} · {fmt(log.duration)}
@@ -134,7 +156,7 @@ function DetailDrawer({ log, onClose, lookupName }: { log: CallLogEntry; onClose
         </div>
 
         {/* ── Recording player ── */}
-        {(log.recordingSid || sipFile) && (
+        {(recordingSid || sipFile) && (
           <div style={{ marginBottom: 18 }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', letterSpacing: '0.05em', textTransform: 'uppercase', marginBottom: 8 }}>
               Call Recording
@@ -146,18 +168,23 @@ function DetailDrawer({ log, onClose, lookupName }: { log: CallLogEntry; onClose
               <span style={{ fontSize: 18 }}>🎙️</span>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6 }}>
-                  {log.recordingSid ? 'PSTN Recording (Twilio)' : 'SIP Recording (Asterisk)'}
+                  {recordingSid ? 'PSTN Recording (Twilio)' : 'SIP Recording (Asterisk)'}
                 </div>
                 <audio
                   controls
-                  src={log.recordingSid
-                    ? `/api/recordings/${log.recordingSid}`
+                  src={recordingSid
+                    ? `/api/recordings/${recordingSid}`
                     : `/api/sip-recordings/${sipFile}`
                   }
                   style={{ width: '100%', height: 36 }}
                 />
               </div>
             </div>
+          </div>
+        )}
+        {!recordingSid && !sipFile && log.status === 'answered' && !loading && (
+          <div style={{ marginBottom: 18, fontSize: 12, color: 'var(--text-muted)' }}>
+            🎙️ Recording not yet available — it may still be processing. Reopen this call in a moment.
           </div>
         )}
 
@@ -201,9 +228,10 @@ function PathChip({ label, color }: { label: string; color: string }) {
 }
 
 // ── Mobile card ───────────────────────────────────────────────────────────────
-function MobileLogCard({ log, onCall, onClick, lookupName }: { log: CallLogEntry; onCall: (n: string) => void; onClick: () => void; lookupName: (n: string) => string | null }) {
+function MobileLogCard({ log, onCall, onClick, lookupName, agentName }: { log: CallLogEntry; onCall: (n: string) => void; onClick: () => void; lookupName: (n: string) => string | null; agentName: string }) {
   const num = extractNumber(log.remoteIdentity);
   const display = lookupName(num) ?? num;
+  const { from, to } = fromTo(log, agentName, display);
   const statusColor =
     log.status === 'answered' ? 'var(--green)'
     : log.status === 'missed' ? 'var(--amber)'
@@ -224,8 +252,10 @@ function MobileLogCard({ log, onCall, onClick, lookupName }: { log: CallLogEntry
         {log.direction === 'inbound' ? '↙' : '↗'}
       </span>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>
-          {display}
+        <div style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: 6, overflow: 'hidden' }}>
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{from}</span>
+          <span style={{ color: 'var(--text-muted)', flexShrink: 0 }}>→</span>
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{to}</span>
         </div>
         <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
           {fmtTime(log.startTime)} · {fmt(log.duration)}
@@ -275,13 +305,39 @@ export function CallLogs({
   logs,
   onCall,
   isMobile = false,
+  user,
+  initialExtFilter = null,
 }: {
   logs: CallLogEntry[];
   onCall: (ext: string) => void;
   isMobile?: boolean;
+  user: User;
+  initialExtFilter?: { extensions: string[]; label: string } | null;
 }) {
   const { lookupName } = useContacts();
   const [selected,    setSelected]    = useState<CallLogEntry | null>(null);
+  const [extFilter,   setExtFilter]   = useState(initialExtFilter);
+
+  // Roster of other users — only needed to resolve "who handled this call"
+  // for manager/admin views; an agent's calls are always their own.
+  const [roster, setRoster] = useState<User[]>([]);
+  useEffect(() => {
+    if (user.role === 'agent') return;
+    fetch('/api/users', { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : []))
+      .then(setRoster)
+      .catch(() => {});
+  }, [user.role]);
+
+  const agentNameFor = (ext: string | null | undefined): string => {
+    if (!ext) return '—';
+    if (ext === user.extension) return user.name;
+    return roster.find((u) => u.extension === ext)?.name ?? `Ext ${ext}`;
+  };
+
+  // Agents the current viewer can pick from in the "filter by agent" dropdown —
+  // for a manager that's their own team; for admin it's everyone in the roster.
+  const agentOptions = roster.filter((u) => u.role === 'agent' && u.extension);
   const [filterStatus, setFilterStatus] = useState<FilterStatus>('all');
   const [filterDir,    setFilterDir]    = useState<FilterDir>('all');
   const [search,       setSearch]       = useState('');
@@ -290,6 +346,7 @@ export function CallLogs({
 
   const filtered = useMemo(() => {
     let out = [...logs];
+    if (extFilter)               out = out.filter((l) => l.extension && extFilter.extensions.includes(l.extension));
     if (filterStatus !== 'all') out = out.filter((l) => l.status === filterStatus);
     if (filterDir    !== 'all') out = out.filter((l) => l.direction === filterDir);
     if (search.trim())          out = out.filter((l) => extractNumber(l.remoteIdentity).includes(search.trim()));
@@ -301,7 +358,7 @@ export function CallLogs({
       return sortDir === 'desc' ? -cmp : cmp;
     });
     return out;
-  }, [logs, filterStatus, filterDir, search, sortKey, sortDir]);
+  }, [logs, extFilter, filterStatus, filterDir, search, sortKey, sortDir]);
 
   const toggleSort = (key: SortKey) => {
     if (sortKey === key) setSortDir((d) => d === 'desc' ? 'asc' : 'desc');
@@ -324,6 +381,24 @@ export function CallLogs({
         </button>
       </div>
 
+      {extFilter && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14,
+          padding: '8px 14px', borderRadius: 'var(--radius-md)',
+          background: '#1e3a5f', border: '1px solid #3b82f6', width: 'fit-content',
+        }}>
+          <span style={{ fontSize: 13, color: '#fff' }}>
+            Showing calls for <strong>{extFilter.label}</strong>
+          </span>
+          <button
+            onClick={() => setExtFilter(null)}
+            style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#60a5fa', fontSize: 13, fontWeight: 700, padding: 0 }}
+          >
+            × Clear
+          </button>
+        </div>
+      )}
+
       {/* Filters row */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap', alignItems: 'center' }}>
         <input
@@ -332,6 +407,23 @@ export function CallLogs({
           onChange={(e) => setSearch(e.target.value)}
           style={{ padding: '6px 12px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border)', background: 'var(--surface)', color: 'var(--text-primary)', fontSize: 13, width: 160 }}
         />
+        {agentOptions.length > 0 && (
+          <select
+            value={extFilter?.extensions[0] ?? ''}
+            onChange={(e) => {
+              const ext = e.target.value;
+              if (!ext) { setExtFilter(null); return; }
+              const agent = agentOptions.find((a) => a.extension === ext);
+              if (agent) setExtFilter({ extensions: [ext], label: agent.name });
+            }}
+            style={{ padding: '6px 12px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border)', background: 'var(--surface)', color: 'var(--text-primary)', fontSize: 13 }}
+          >
+            <option value="">All Agents</option>
+            {agentOptions.map((a) => (
+              <option key={a.id} value={a.extension!}>{a.name}</option>
+            ))}
+          </select>
+        )}
         {(['all','answered','missed','failed'] as FilterStatus[]).map((s) => (
           <button key={s} onClick={() => setFilterStatus(s)} style={{
             padding: '5px 12px', borderRadius: 99, fontSize: 12, fontWeight: 600, cursor: 'pointer', border: '1px solid',
@@ -383,7 +475,7 @@ export function CallLogs({
         // ── Mobile: card list ──
         <div style={{ background: 'var(--surface)', borderRadius: 'var(--radius-lg)', border: '1px solid var(--border)', overflow: 'hidden', boxShadow: 'var(--shadow-sm)' }}>
           {filtered.map((log) => (
-            <MobileLogCard key={log.id} log={log} onCall={onCall} onClick={() => setSelected(log)} lookupName={lookupName} />
+            <MobileLogCard key={log.id} log={log} onCall={onCall} onClick={() => setSelected(log)} lookupName={lookupName} agentName={agentNameFor(log.extension)} />
           ))}
         </div>
       ) : (
@@ -392,7 +484,7 @@ export function CallLogs({
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
             <thead>
               <tr style={{ background: 'var(--border-light)', borderBottom: '1px solid var(--border)' }}>
-                {['Direction', 'Number', 'Time', 'Duration', 'Status', 'IVR', ''].map((h, i) => (
+                {['Direction', 'Call', 'Time', 'Duration', 'Status', 'IVR', ''].map((h, i) => (
                   <th key={i} style={{ padding: '10px 16px', textAlign: 'left', fontWeight: 600, fontSize: 11, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--text-muted)' }}>
                     {h}
                   </th>
@@ -400,7 +492,10 @@ export function CallLogs({
               </tr>
             </thead>
             <tbody>
-              {filtered.map((log, idx) => (
+              {filtered.map((log, idx) => {
+                const remoteDisplay = lookupName(extractNumber(log.remoteIdentity)) ?? extractNumber(log.remoteIdentity);
+                const { from, to } = fromTo(log, agentNameFor(log.extension), remoteDisplay);
+                return (
                 <tr
                   key={log.id}
                   style={{ borderBottom: idx < filtered.length - 1 ? '1px solid var(--border-light)' : 'none', transition: 'background 0.1s', cursor: 'pointer' }}
@@ -415,7 +510,9 @@ export function CallLogs({
                     }
                   </td>
                   <td style={{ padding: '12px 16px', fontFamily: 'var(--font-mono)', fontWeight: 500, color: 'var(--text-primary)' }}>
-                    {lookupName(extractNumber(log.remoteIdentity)) ?? extractNumber(log.remoteIdentity)}
+                    <span>{from}</span>
+                    <span style={{ color: 'var(--text-muted)', margin: '0 6px' }}>→</span>
+                    <span>{to}</span>
                   </td>
                   <td style={{ padding: '12px 16px', color: 'var(--text-secondary)' }}>{fmtTime(log.startTime)}</td>
                   <td style={{ padding: '12px 16px', fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}>{fmt(log.duration)}</td>
@@ -440,13 +537,14 @@ export function CallLogs({
                     <button onClick={() => onCall(extractNumber(log.remoteIdentity))} style={callBackBtn}>Call Back</button>
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
       )}
 
-      {selected && <DetailDrawer log={selected} onClose={() => setSelected(null)} lookupName={lookupName} />}
+      {selected && <DetailDrawer log={selected} onClose={() => setSelected(null)} lookupName={lookupName} agentName={agentNameFor(selected.extension)} />}
     </div>
   );
 }

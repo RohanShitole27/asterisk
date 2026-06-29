@@ -1,13 +1,125 @@
 import express from 'express';
 import cors from 'cors';
+import cookieParser from 'cookie-parser';
 import pg from 'pg';
 import twilio from 'twilio';
-import { existsSync, readdirSync, statSync, createReadStream } from 'fs';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { existsSync, readdirSync, statSync, createReadStream, readFileSync, writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { randomUUID } from 'crypto';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// ── Asterisk extension auto-provisioning ────────────────────────────────────────
+// When an admin assigns a new extension to a user, we write a matching SIP
+// endpoint into the project's pjsip.conf/extensions.conf, deploy them to the
+// running Asterisk instance, and reload — no manual config editing required.
+const PJSIP_CONF_PATH       = join(__dirname, '..', 'asterisk-config', 'pjsip.conf');
+const EXTENSIONS_CONF_PATH  = join(__dirname, '..', 'asterisk-config', 'extensions.conf');
+const SIP_DEFAULT_PASSWORD  = '1234';
+
+function extensionExists(ext) {
+  if (!existsSync(PJSIP_CONF_PATH)) return true; // no local config to manage — assume it's handled elsewhere
+  const content = readFileSync(PJSIP_CONF_PATH, 'utf8');
+  return new RegExp(`^\\[${ext}\\]`, 'm').test(content);
+}
+
+function appendPjsipExtension(ext) {
+  const block = `
+; ─── Extension ${ext} (auto-provisioned) ──────────────────────────────────────
+
+[${ext}]
+type=endpoint
+transport=transport-wss
+context=internal
+disallow=all
+allow=opus,ulaw,alaw
+auth=${ext}
+aors=${ext}
+webrtc=yes
+dtls_auto_generate_cert=yes
+use_avpf=yes
+media_encryption=dtls
+dtls_verify=no
+dtls_setup=actpass
+ice_support=yes
+rtcp_mux=yes
+direct_media=no
+force_rport=yes
+rewrite_contact=yes
+rtp_symmetric=yes
+
+[${ext}]
+type=aor
+max_contacts=5
+remove_existing=yes
+qualify_frequency=0
+
+[${ext}]
+type=auth
+auth_type=userpass
+username=${ext}
+password=${SIP_DEFAULT_PASSWORD}
+`;
+  const content = readFileSync(PJSIP_CONF_PATH, 'utf8');
+  const marker  = '; ─── Twilio Elastic SIP Trunk';
+  const idx     = content.indexOf(marker);
+  writeFileSync(PJSIP_CONF_PATH, idx === -1 ? content + block : content.slice(0, idx) + block + '\n' + content.slice(idx));
+}
+
+function appendDialplanExtension(ext) {
+  const block = `
+exten => ${ext},1,Set(RECFILE=/var/spool/asterisk/monitor/\${STRFTIME(\${EPOCH},,"%Y%m%d-%H%M%S")}-\${CALLERID(num)}-${ext}.wav)
+ same => n,MixMonitor(\${RECFILE},b,/usr/bin/chmod 644 \${RECFILE})
+ same => n,Dial(PJSIP/${ext},30,tT)
+ same => n,Hangup()
+`;
+  const content = readFileSync(EXTENSIONS_CONF_PATH, 'utf8');
+  const marker  = '; Echo test';
+  const idx     = content.indexOf(marker);
+  writeFileSync(EXTENSIONS_CONF_PATH, idx === -1 ? content + block : content.slice(0, idx) + block + '\n' + content.slice(idx));
+}
+
+/** Copies the local config files into the running Asterisk instance and reloads. */
+async function deployAsteriskConfig() {
+  const winToWsl = (p) => p.replace(/\\/g, '/').replace(/^([A-Za-z]):/, (_, d) => `/mnt/${d.toLowerCase()}`);
+  if (process.platform === 'win32') {
+    const pjsipWsl = winToWsl(PJSIP_CONF_PATH);
+    const extWsl   = winToWsl(EXTENSIONS_CONF_PATH);
+    await execAsync(
+      `wsl -u root -e bash -c "cp '${pjsipWsl}' /etc/asterisk/pjsip.conf && cp '${extWsl}' /etc/asterisk/extensions.conf && asterisk -rx 'pjsip reload' && asterisk -rx 'dialplan reload'"`
+    );
+  } else {
+    await execAsync(
+      `cp "${PJSIP_CONF_PATH}" /etc/asterisk/pjsip.conf && cp "${EXTENSIONS_CONF_PATH}" /etc/asterisk/extensions.conf && asterisk -rx "pjsip reload" && asterisk -rx "dialplan reload"`
+    );
+  }
+}
+
+/**
+ * Ensures a SIP extension exists in Asterisk, provisioning it automatically
+ * if it doesn't. Only handles purely-numeric extensions (e.g. "1005") — never
+ * touches PSTN numbers. Failures are logged but never block the caller, since
+ * account creation shouldn't fail just because Asterisk is unreachable.
+ */
+async function ensureExtensionProvisioned(ext) {
+  if (!ext || !/^\d{2,8}$/.test(ext)) return;
+  if (extensionExists(ext)) return;
+  try {
+    appendPjsipExtension(ext);
+    appendDialplanExtension(ext);
+    await deployAsteriskConfig();
+    console.log(`[asterisk-provision] Auto-provisioned extension ${ext}`);
+  } catch (err) {
+    console.error(`[asterisk-provision] Failed to provision extension ${ext}:`, err.message);
+  }
+}
 
 const { Pool } = pg;
 
@@ -20,9 +132,23 @@ const pool = new Pool({
 });
 
 const app = express();
-app.use(cors());
+// Wildcard CORS is fine for a same-origin deployment (Express serves the built
+// frontend), but if the frontend is ever split onto another origin, a bare
+// cors() reflecting every origin alongside cookie-based auth is too permissive.
+// FRONTEND_ORIGIN restricts it explicitly when set.
+app.use(cors(process.env.FRONTEND_ORIGIN
+  ? { origin: process.env.FRONTEND_ORIGIN, credentials: true }
+  : {}));
+app.use(cookieParser());
 app.use(express.json());
 app.use(express.urlencoded({ extended: false })); // Twilio sends form-encoded POST bodies
+
+// ── Auth config ────────────────────────────────────────────────────────────────
+const JWT_SECRET = process.env.JWT_SECRET ?? 'dev-only-insecure-secret-change-me';
+if (!process.env.JWT_SECRET) {
+  console.warn('⚠ JWT_SECRET not set in .env — using an insecure default. Set one before deploying.');
+}
+const SESSION_TTL = '12h';
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────────
 async function initDb() {
@@ -78,6 +204,10 @@ async function initDb() {
   await pool.query(`ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS recording_sid VARCHAR(100)`);
   await pool.query(`ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS sip_recording_file TEXT`);
 
+  // Tags each call_logs row with the extension that handled it, so manager/agent
+  // views can be filtered to only the calls relevant to them.
+  await pool.query(`ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS extension VARCHAR(50)`);
+
   // Recording + transcript columns on voicemail_messages
   await pool.query(`ALTER TABLE voicemail_messages ADD COLUMN IF NOT EXISTS recording_sid VARCHAR(100)`);
   await pool.query(`ALTER TABLE voicemail_messages ADD COLUMN IF NOT EXISTS recording_url TEXT`);
@@ -95,12 +225,298 @@ async function initDb() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS ivr_events_call_sid_idx ON ivr_events (call_sid)`);
+
+  // Users — login accounts, roles, and extension assignment
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id            SERIAL PRIMARY KEY,
+      name          VARCHAR(255) NOT NULL,
+      email         VARCHAR(255) NOT NULL UNIQUE,
+      password_hash TEXT         NOT NULL,
+      role          VARCHAR(20)  NOT NULL DEFAULT 'agent',
+      extension     VARCHAR(50),
+      is_active     BOOLEAN      NOT NULL DEFAULT TRUE,
+      created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  // manager_id: which manager this agent reports to. Admin assigns this from the
+  // manager's edit screen, which controls which agents' calls a manager can see.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS manager_id INTEGER REFERENCES users(id) ON DELETE SET NULL`);
+
+  // Seed one demo account per role on a fresh database so there's always a way in
+  // for each role (used by the quick-login buttons on the Login page).
+  // Credentials are printed once to the server console — change passwords after first login.
+  const { rows: userCount } = await pool.query('SELECT COUNT(*)::int AS n FROM users');
+  if (userCount[0].n === 0) {
+    const demoUsers = [
+      { name: 'Admin',   email: 'admin@company.com',   password: 'admin123',   role: 'admin',   extension: null },
+      { name: 'Manager', email: 'manager@company.com', password: 'manager123', role: 'manager', extension: null },
+      { name: 'Agent',   email: 'agent@company.com',   password: 'agent123',   role: 'agent',    extension: '1001' },
+    ];
+    for (const u of demoUsers) {
+      const hash = await bcrypt.hash(u.password, 10);
+      await pool.query(
+        `INSERT INTO users (name, email, password_hash, role, extension) VALUES ($1, $2, $3, $4, $5)`,
+        [u.name, u.email, hash, u.role, u.extension]
+      );
+    }
+    console.log('Seeded demo accounts — change these passwords before real use:');
+    demoUsers.forEach((u) => console.log(`  ${u.role.padEnd(8)} ${u.email} / ${u.password}`));
+  }
 }
+
+// ── Auth ───────────────────────────────────────────────────────────────────────
+
+function userToJson(u) {
+  return {
+    id: u.id, name: u.name, email: u.email, role: u.role,
+    extension: u.extension, isActive: u.is_active, managerId: u.manager_id,
+  };
+}
+
+function signSession(user) {
+  return jwt.sign(
+    { sub: user.id, role: user.role, extension: user.extension },
+    JWT_SECRET,
+    { expiresIn: SESSION_TTL }
+  );
+}
+
+/** Verifies the session cookie and attaches req.user. 401s if missing/invalid/inactive. */
+async function requireAuth(req, res, next) {
+  const token = req.cookies?.session;
+  if (!token) return res.status(401).json({ error: 'Not authenticated' });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [payload.sub]);
+    const user = rows[0];
+    if (!user || !user.is_active) return res.status(401).json({ error: 'Not authenticated' });
+    req.user = user;
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Not authenticated' });
+  }
+}
+
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!roles.includes(req.user.role)) return res.status(403).json({ error: 'Forbidden' });
+    next();
+  };
+}
+
+// In-memory login rate limiter — 10 attempts per email per 15 minutes.
+// Resets on server restart and isn't shared across instances, but that's an
+// acceptable tradeoff for a single-instance deployment versus having zero
+// brute-force protection on the login endpoint at all.
+const LOGIN_LIMIT       = 10;
+const LOGIN_WINDOW_MS   = 15 * 60 * 1000;
+const loginAttempts     = new Map(); // email -> { count, resetAt }
+function checkLoginRateLimit(email) {
+  const now = Date.now();
+  const entry = loginAttempts.get(email);
+  if (!entry || now > entry.resetAt) {
+    loginAttempts.set(email, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+    return true;
+  }
+  entry.count += 1;
+  return entry.count <= LOGIN_LIMIT;
+}
+
+// POST /api/auth/login
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body ?? {};
+  if (!email?.trim() || !password) return res.status(400).json({ error: 'email and password are required' });
+  const normalizedEmail = email.trim().toLowerCase();
+  if (!checkLoginRateLimit(normalizedEmail)) {
+    return res.status(429).json({ error: 'Too many login attempts. Try again later.' });
+  }
+  try {
+    const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [normalizedEmail]);
+    const user = rows[0];
+    if (!user || !user.is_active) return res.status(401).json({ error: 'Invalid email or password' });
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) return res.status(401).json({ error: 'Invalid email or password' });
+
+    const token = signSession(user);
+    res.cookie('session', token, {
+      httpOnly: true,
+      sameSite: 'lax',
+      maxAge: 12 * 60 * 60 * 1000,
+    });
+    res.json({ user: userToJson(user) });
+  } catch (err) {
+    console.error('POST /api/auth/login:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/auth/logout
+app.post('/api/auth/logout', (_req, res) => {
+  res.clearCookie('session');
+  res.status(204).end();
+});
+
+// GET /api/auth/me — returns the current session's user, or 401
+app.get('/api/auth/me', requireAuth, (req, res) => {
+  res.json({ user: userToJson(req.user) });
+});
+
+// ── Users ──────────────────────────────────────────────────────────────────────
+
+// GET /api/users — admin sees everyone; manager sees their own team's roster
+// (their assigned agents plus themselves); agent has no use for this.
+app.get('/api/users', requireAuth, async (req, res) => {
+  if (req.user.role === 'agent') return res.status(403).json({ error: 'Forbidden' });
+  try {
+    const { rows } = req.user.role === 'admin'
+      ? await pool.query('SELECT * FROM users ORDER BY name ASC')
+      : await pool.query('SELECT * FROM users WHERE manager_id = $1 OR id = $1 ORDER BY name ASC', [req.user.id]);
+    res.json(rows.map(userToJson));
+  } catch (err) {
+    console.error('GET /api/users:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/users — create a new user
+app.post('/api/users', requireAuth, requireRole('admin'), async (req, res) => {
+  const { name, email, password, role, extension } = req.body ?? {};
+  if (!name?.trim() || !email?.trim() || !password || !role) {
+    return res.status(400).json({ error: 'name, email, password, and role are required' });
+  }
+  if (!['admin', 'manager', 'agent'].includes(role)) {
+    return res.status(400).json({ error: 'role must be admin, manager, or agent' });
+  }
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    const ext  = extension?.trim() || null;
+    const { rows } = await pool.query(
+      `INSERT INTO users (name, email, password_hash, role, extension)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [name.trim(), email.trim().toLowerCase(), hash, role, ext]
+    );
+    if (ext) await ensureExtensionProvisioned(ext);
+    res.status(201).json(userToJson(rows[0]));
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'A user with that email already exists' });
+    console.error('POST /api/users:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/users/:id — edit name, role, extension, active status (password optional)
+app.put('/api/users/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  const id = Number(req.params.id);
+  const { name, role, extension, isActive, password } = req.body ?? {};
+  if (!name?.trim() || !role) return res.status(400).json({ error: 'name and role are required' });
+  if (!['admin', 'manager', 'agent'].includes(role)) {
+    return res.status(400).json({ error: 'role must be admin, manager, or agent' });
+  }
+  try {
+    const passwordHash = password ? await bcrypt.hash(password, 10) : null;
+    const ext = extension?.trim() || null;
+    const { rows } = await pool.query(
+      `UPDATE users
+          SET name = $1, role = $2, extension = $3, is_active = $4,
+              password_hash = COALESCE($5, password_hash)
+        WHERE id = $6
+        RETURNING *`,
+      [name.trim(), role, ext, isActive ?? true, passwordHash, id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    if (ext) await ensureExtensionProvisioned(ext);
+    res.json(userToJson(rows[0]));
+  } catch (err) {
+    console.error('PUT /api/users/:id:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/users/:id — admin only. Can't delete your own account (avoids
+// accidental lockout). Agents reporting to a deleted manager are automatically
+// unassigned (manager_id FK is ON DELETE SET NULL); their SIP extension stays
+// provisioned in Asterisk but becomes "Unassigned" until reassigned.
+app.delete('/api/users/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  const id = Number(req.params.id);
+  if (id === req.user.id) return res.status(400).json({ error: "You can't delete your own account" });
+  try {
+    const { rowCount } = await pool.query('DELETE FROM users WHERE id = $1', [id]);
+    if (rowCount === 0) return res.status(404).json({ error: 'User not found' });
+    res.status(204).end();
+  } catch (err) {
+    console.error('DELETE /api/users/:id:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/users/:id/team — set which agents report to this manager.
+// Body: { agentIds: number[] }. Full replace: any agent currently assigned to
+// this manager but not in the new list gets unassigned (manager_id = NULL).
+app.put('/api/users/:id/team', requireAuth, requireRole('admin'), async (req, res) => {
+  const managerId = Number(req.params.id);
+  const { agentIds } = req.body ?? {};
+  if (!Array.isArray(agentIds)) return res.status(400).json({ error: 'agentIds must be an array' });
+  try {
+    const { rows: managerRows } = await pool.query('SELECT role FROM users WHERE id = $1', [managerId]);
+    if (managerRows.length === 0) return res.status(404).json({ error: 'Manager not found' });
+    if (managerRows[0].role !== 'manager') return res.status(400).json({ error: 'Target user is not a manager' });
+
+    await pool.query('UPDATE users SET manager_id = NULL WHERE manager_id = $1', [managerId]);
+    if (agentIds.length > 0) {
+      await pool.query(
+        `UPDATE users SET manager_id = $1 WHERE id = ANY($2::int[]) AND role = 'agent'`,
+        [managerId, agentIds]
+      );
+    }
+    const { rows } = await pool.query('SELECT * FROM users ORDER BY name ASC');
+    res.json(rows.map(userToJson));
+  } catch (err) {
+    console.error('PUT /api/users/:id/team:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Extension Management (manager only) ─────────────────────────────────────────
+
+/** Reads pjsip.conf and returns every numeric extension provisioned as an endpoint. */
+function listProvisionedExtensions() {
+  if (!existsSync(PJSIP_CONF_PATH)) return [];
+  const content = readFileSync(PJSIP_CONF_PATH, 'utf8');
+  const exts = new Set();
+  const sectionRe = /^\[(\d+)\]\s*\ntype=endpoint/gm;
+  let m;
+  while ((m = sectionRe.exec(content)) !== null) exts.add(m[1]);
+  return Array.from(exts).sort((a, b) => Number(a) - Number(b));
+}
+
+// GET /api/extensions/directory — visible to every logged-in user (any role).
+// A read-only company-wide directory of every provisioned SIP extension and
+// who it's assigned to. Unlike /api/extensions below, this has no team
+// scoping and no reassignment capability — just "who do I dial for X".
+app.get('/api/extensions/directory', requireAuth, async (_req, res) => {
+  try {
+    const extensions = listProvisionedExtensions();
+    const { rows: owners } = await pool.query(
+      'SELECT name, extension FROM users WHERE extension = ANY($1::text[])',
+      [extensions]
+    );
+    const nameByExt = new Map(owners.map((o) => [o.extension, o.name]));
+    res.json(extensions.map((extension) => ({
+      extension,
+      assignedTo: nameByExt.get(extension) ?? null,
+    })));
+  } catch (err) {
+    console.error('GET /api/extensions/directory:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ── Routes ─────────────────────────────────────────────────────────────────────
 
 // GET /api/contacts
-app.get('/api/contacts', async (_req, res) => {
+app.get('/api/contacts', requireAuth, async (_req, res) => {
   try {
     const { rows } = await pool.query(
       'SELECT id, name, extension FROM contacts ORDER BY name ASC'
@@ -113,7 +529,7 @@ app.get('/api/contacts', async (_req, res) => {
 });
 
 // POST /api/contacts
-app.post('/api/contacts', async (req, res) => {
+app.post('/api/contacts', requireAuth, async (req, res) => {
   const { name, extension } = req.body ?? {};
   if (!name?.trim() || !extension?.trim()) {
     return res.status(400).json({ error: 'name and extension are required' });
@@ -131,7 +547,7 @@ app.post('/api/contacts', async (req, res) => {
 });
 
 // PUT /api/contacts/:id
-app.put('/api/contacts/:id', async (req, res) => {
+app.put('/api/contacts/:id', requireAuth, async (req, res) => {
   const id = Number(req.params.id);
   const { name, extension } = req.body ?? {};
   if (!name?.trim() || !extension?.trim()) {
@@ -154,7 +570,7 @@ app.put('/api/contacts/:id', async (req, res) => {
 });
 
 // DELETE /api/contacts/:id
-app.delete('/api/contacts/:id', async (req, res) => {
+app.delete('/api/contacts/:id', requireAuth, async (req, res) => {
   const id = Number(req.params.id);
   try {
     const { rowCount } = await pool.query(
@@ -172,7 +588,7 @@ app.delete('/api/contacts/:id', async (req, res) => {
 // ── Voicemail Routes ───────────────────────────────────────────────────────────
 
 // GET /api/voicemails
-app.get('/api/voicemails', async (_req, res) => {
+app.get('/api/voicemails', requireAuth, async (_req, res) => {
   try {
     const { rows } = await pool.query(
       'SELECT * FROM voicemail_messages ORDER BY received_at DESC'
@@ -185,7 +601,7 @@ app.get('/api/voicemails', async (_req, res) => {
 });
 
 // POST /api/voicemails
-app.post('/api/voicemails', async (req, res) => {
+app.post('/api/voicemails', requireAuth, async (req, res) => {
   const { caller, duration, notes } = req.body ?? {};
   if (!caller?.trim()) return res.status(400).json({ error: 'caller is required' });
   try {
@@ -202,7 +618,7 @@ app.post('/api/voicemails', async (req, res) => {
 });
 
 // PATCH /api/voicemails/:id/read
-app.patch('/api/voicemails/:id/read', async (req, res) => {
+app.patch('/api/voicemails/:id/read', requireAuth, async (req, res) => {
   const id = Number(req.params.id);
   try {
     const { rows } = await pool.query(
@@ -218,7 +634,7 @@ app.patch('/api/voicemails/:id/read', async (req, res) => {
 });
 
 // DELETE /api/voicemails/:id
-app.delete('/api/voicemails/:id', async (req, res) => {
+app.delete('/api/voicemails/:id', requireAuth, async (req, res) => {
   const id = Number(req.params.id);
   try {
     const { rowCount } = await pool.query(
@@ -247,16 +663,35 @@ function rowToLog(r) {
     ivrCompleted:     r.ivr_completed     ?? false,
     recordingSid:     r.recording_sid     ?? null,
     sipRecordingFile: r.sip_recording_file ?? null,
+    extension:        r.extension          ?? null,
   };
 }
 
 // GET /api/call-logs?source=asterisk|twilio
-app.get('/api/call-logs', async (req, res) => {
+// Visibility by role: admin sees everything; manager sees their team's calls
+// (plus their own, if they have an extension); agent sees only their own.
+app.get('/api/call-logs', requireAuth, async (req, res) => {
   const { source } = req.query;
   try {
-    const { rows } = source
-      ? await pool.query('SELECT * FROM call_logs WHERE source = $1 ORDER BY start_time DESC', [source])
-      : await pool.query('SELECT * FROM call_logs ORDER BY start_time DESC');
+    let extensionFilter = null; // null = no filter (admin)
+    if (req.user.role === 'manager') {
+      const { rows: team } = await pool.query(
+        `SELECT extension FROM users WHERE manager_id = $1 AND extension IS NOT NULL`,
+        [req.user.id]
+      );
+      extensionFilter = team.map((t) => t.extension);
+      if (req.user.extension) extensionFilter.push(req.user.extension);
+    } else if (req.user.role === 'agent') {
+      extensionFilter = req.user.extension ? [req.user.extension] : [];
+    }
+
+    const conditions = [];
+    const params = [];
+    if (source) { params.push(source); conditions.push(`source = $${params.length}`); }
+    if (extensionFilter) { params.push(extensionFilter); conditions.push(`extension = ANY($${params.length}::text[])`); }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const { rows } = await pool.query(`SELECT * FROM call_logs ${where} ORDER BY start_time DESC`, params);
     res.json(rows.map(rowToLog));
   } catch (err) {
     console.error('GET /api/call-logs:', err.message);
@@ -264,22 +699,55 @@ app.get('/api/call-logs', async (req, res) => {
   }
 });
 
+// GET /api/call-logs/:id — fetch the latest copy of a single call (used to pick up
+// recordingSid/sipRecordingFile that arrive asynchronously after the call ends)
+app.get('/api/call-logs/:id', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM call_logs WHERE id = $1', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    const log = rows[0];
+
+    // Same visibility rule as the list endpoint — without this, any
+    // authenticated agent could fetch any other agent's call (and its
+    // recording SID) just by guessing/iterating call IDs.
+    if (req.user.role === 'agent') {
+      if (log.extension !== req.user.extension) return res.status(404).json({ error: 'Not found' });
+    } else if (req.user.role === 'manager') {
+      const { rows: team } = await pool.query(
+        `SELECT extension FROM users WHERE manager_id = $1 AND extension IS NOT NULL`,
+        [req.user.id]
+      );
+      const allowed = new Set(team.map((t) => t.extension));
+      if (req.user.extension) allowed.add(req.user.extension);
+      if (!log.extension || !allowed.has(log.extension)) return res.status(404).json({ error: 'Not found' });
+    }
+
+    res.json(rowToLog(log));
+  } catch (err) {
+    console.error('GET /api/call-logs/:id:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/call-logs
-app.post('/api/call-logs', async (req, res) => {
+app.post('/api/call-logs', requireAuth, async (req, res) => {
   const { id, source, direction, remoteIdentity, startTime, endTime, duration, status } = req.body ?? {};
   if (!id || !direction || !remoteIdentity || !startTime || !status) {
     return res.status(400).json({ error: 'id, direction, remoteIdentity, startTime, status are required' });
   }
   try {
+    // Extension is attributed server-side from the session, not trusted from the
+    // client, so call ownership for manager/agent filtering can't be spoofed.
     const { rows } = await pool.query(
-      `INSERT INTO call_logs (id, source, direction, remote_identity, start_time, end_time, duration, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `INSERT INTO call_logs (id, source, direction, remote_identity, start_time, end_time, duration, status, extension)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (id) DO UPDATE
-         SET end_time = EXCLUDED.end_time,
-             duration = EXCLUDED.duration,
-             status   = EXCLUDED.status
+         SET end_time  = EXCLUDED.end_time,
+             duration  = EXCLUDED.duration,
+             status    = EXCLUDED.status,
+             extension = COALESCE(call_logs.extension, EXCLUDED.extension)
        RETURNING *`,
-      [id, source ?? 'asterisk', direction, remoteIdentity, startTime, endTime ?? null, duration ?? null, status]
+      [id, source ?? 'asterisk', direction, remoteIdentity, startTime, endTime ?? null, duration ?? null, status, req.user.extension ?? null]
     );
     res.status(201).json(rows[0] ? rowToLog(rows[0]) : {});
   } catch (err) {
@@ -289,7 +757,9 @@ app.post('/api/call-logs', async (req, res) => {
 });
 
 // DELETE /api/call-logs?source=asterisk|twilio  (omit source to clear all)
-app.delete('/api/call-logs', async (req, res) => {
+// Destructive + company-wide, so it's admin-only — any authenticated agent
+// being able to wipe every call record was a critical broken-access-control gap.
+app.delete('/api/call-logs', requireAuth, requireRole('admin'), async (req, res) => {
   const { source } = req.query;
   try {
     if (source) {
@@ -308,7 +778,7 @@ app.delete('/api/call-logs', async (req, res) => {
 
 // GET /api/recordings/:sid — proxy Twilio recording audio with server-side auth
 // The browser <audio> tag cannot add Twilio credentials, so we proxy here.
-app.get('/api/recordings/:sid', async (req, res) => {
+app.get('/api/recordings/:sid', requireAuth, async (req, res) => {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_API_KEY || !TWILIO_API_SECRET) {
     return res.status(503).json({ error: 'Twilio credentials not configured' });
   }
@@ -345,12 +815,29 @@ const WSL_MONITOR_DIR  = '\\\\wsl$\\Ubuntu\\var\\spool\\asterisk\\monitor';
 const LINUX_MONITOR_DIR = '/var/spool/asterisk/monitor';
 const SIP_MONITOR_DIR  = existsSync(LINUX_MONITOR_DIR) ? LINUX_MONITOR_DIR : WSL_MONITOR_DIR;
 
-// GET /api/sip-recordings — list all SIP recording files
-app.get('/api/sip-recordings', (_req, res) => {
+// Returns the set of extensions `user` is allowed to see recordings for, or
+// `null` to mean "no restriction" (admin). Mirrors the call-logs visibility rule.
+async function allowedExtensionsFor(user) {
+  if (user.role === 'admin') return null;
+  if (user.role === 'agent') return new Set(user.extension ? [user.extension] : []);
+  const { rows: team } = await pool.query(
+    `SELECT extension FROM users WHERE manager_id = $1 AND extension IS NOT NULL`,
+    [user.id]
+  );
+  const allowed = new Set(team.map((t) => t.extension));
+  if (user.extension) allowed.add(user.extension);
+  return allowed;
+}
+
+// GET /api/sip-recordings — list SIP recording files visible to the caller.
+// Without extension scoping here, any authenticated agent could browse and
+// play back every other agent's call recordings company-wide.
+app.get('/api/sip-recordings', requireAuth, async (req, res) => {
   try {
     if (!existsSync(SIP_MONITOR_DIR)) {
       return res.json([]);
     }
+    const allowed = await allowedExtensionsFor(req.user);
     const files = readdirSync(SIP_MONITOR_DIR)
       .filter((f) => f.endsWith('.wav') || f.endsWith('.mp3'))
       .map((filename) => {
@@ -365,6 +852,7 @@ app.get('/api/sip-recordings', (_req, res) => {
           callee:    parts[3] ?? null,
         };
       })
+      .filter((f) => !allowed || f.caller === null && f.callee === null || allowed.has(f.caller) || allowed.has(f.callee))
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
     res.json(files);
   } catch (err) {
@@ -374,7 +862,7 @@ app.get('/api/sip-recordings', (_req, res) => {
 });
 
 // GET /api/sip-recordings/:filename — stream a SIP recording file
-app.get('/api/sip-recordings/:filename', (req, res) => {
+app.get('/api/sip-recordings/:filename', requireAuth, async (req, res) => {
   const { filename } = req.params;
   // Sanitise — only allow safe filenames
   if (!/^[\w\-]+\.(wav|mp3)$/.test(filename)) {
@@ -384,6 +872,17 @@ app.get('/api/sip-recordings/:filename', (req, res) => {
   if (!existsSync(filePath)) {
     return res.status(404).json({ error: 'Recording not found' });
   }
+
+  const allowed = await allowedExtensionsFor(req.user);
+  if (allowed) {
+    const parts = filename.replace(/\.(wav|mp3)$/, '').split('-');
+    const caller = parts[2] ?? null;
+    const callee = parts[3] ?? null;
+    if (!allowed.has(caller) && !allowed.has(callee)) {
+      return res.status(404).json({ error: 'Recording not found' });
+    }
+  }
+
   const stat = statSync(filePath);
   const ext  = filename.endsWith('.mp3') ? 'audio/mpeg' : 'audio/wav';
   res.setHeader('Content-Type', ext);
@@ -394,7 +893,7 @@ app.get('/api/sip-recordings/:filename', (req, res) => {
 
 // POST /api/sip-recordings/link — called after a SIP call ends to link the
 // recording file to the call log entry (matched by timestamp + identities)
-app.post('/api/sip-recordings/link', async (req, res) => {
+app.post('/api/sip-recordings/link', requireAuth, async (req, res) => {
   const { callId, filename } = req.body ?? {};
   if (!callId || !filename) return res.status(400).json({ error: 'callId and filename required' });
   try {
@@ -410,7 +909,7 @@ app.post('/api/sip-recordings/link', async (req, res) => {
 });
 
 // GET /api/ivr-events?call_sid=CA...  (omit for last 200 events across all calls)
-app.get('/api/ivr-events', async (req, res) => {
+app.get('/api/ivr-events', requireAuth, async (req, res) => {
   const { call_sid } = req.query;
   try {
     const { rows } = call_sid
@@ -436,6 +935,7 @@ const {
   TWILIO_API_SECRET,
   TWILIO_TWIML_APP_SID,
   TWILIO_PHONE_NUMBER,
+  TWILIO_AUTH_TOKEN,
 } = process.env;
 
 // REST client used for outbound dials (agent ring-out) and call redirects.
@@ -443,6 +943,24 @@ const {
 const twilioRest = (TWILIO_ACCOUNT_SID && TWILIO_API_KEY && TWILIO_API_SECRET)
   ? twilio(TWILIO_API_KEY, TWILIO_API_SECRET, { accountSid: TWILIO_ACCOUNT_SID })
   : null;
+
+// Verifies that an inbound webhook POST actually came from Twilio (checks the
+// X-Twilio-Signature header against TWILIO_AUTH_TOKEN). Without this, anyone
+// who finds these URLs can forge call/IVR/voicemail events straight into the
+// database. Only enforced when TWILIO_AUTH_TOKEN is configured, matching the
+// JWT_SECRET pattern elsewhere in this file — but unlike JWT_SECRET there's no
+// safe default, so it's a warn-and-allow rather than a hard requirement.
+if (!TWILIO_AUTH_TOKEN) {
+  console.warn('⚠ TWILIO_AUTH_TOKEN not set — incoming Twilio webhooks are NOT signature-verified. Set it before deploying.');
+}
+function verifyTwilioSignature(req, res, next) {
+  if (!TWILIO_AUTH_TOKEN) return next(); // unconfigured — see warning above
+  const signature = req.headers['x-twilio-signature'];
+  const url = buildBaseUrl(req) + req.originalUrl;
+  const valid = twilio.validateRequest(TWILIO_AUTH_TOKEN, signature, url, req.body);
+  if (!valid) return res.status(403).json({ error: 'Invalid Twilio signature' });
+  next();
+}
 
 // ── Shared IVR helpers ─────────────────────────────────────────────────────────
 
@@ -489,7 +1007,7 @@ function ivrFailTwiml() {
 }
 
 // GET /api/twilio/debug — quick sanity check (never expose in production)
-app.get('/api/twilio/debug', (_req, res) => {
+app.get('/api/twilio/debug', requireAuth, requireRole('admin'), (_req, res) => {
   res.json({
     TWILIO_ACCOUNT_SID:    TWILIO_ACCOUNT_SID   ? `${TWILIO_ACCOUNT_SID.slice(0, 6)}…`   : 'MISSING',
     TWILIO_API_KEY:        TWILIO_API_KEY        ? `${TWILIO_API_KEY.slice(0, 6)}…`        : 'MISSING',
@@ -499,15 +1017,19 @@ app.get('/api/twilio/debug', (_req, res) => {
   });
 });
 
-// GET /api/twilio/token  — browser fetches this to register the Twilio Device
-app.get('/api/twilio/token', (req, res) => {
+// GET /api/twilio/token  — browser fetches this to register the Twilio Device.
+// Identity comes from the logged-in user's assigned extension, not a URL param.
+app.get('/api/twilio/token', requireAuth, (req, res) => {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_API_KEY || !TWILIO_API_SECRET) {
     return res.status(503).json({ error: 'Twilio credentials not configured in .env' });
+  }
+  if (!req.user.extension) {
+    return res.status(400).json({ error: 'Your account has no extension assigned — ask an admin to assign one' });
   }
   const AccessToken = twilio.jwt.AccessToken;
   const VoiceGrant  = AccessToken.VoiceGrant;
 
-  const ext      = String(req.query.ext ?? '1001').replace(/\D/g, '').slice(0, 6);
+  const ext      = String(req.user.extension).replace(/\D/g, '').slice(0, 6);
   const identity = `softphone-${ext}`;
   const token = new AccessToken(
     TWILIO_ACCOUNT_SID,
@@ -537,7 +1059,7 @@ function normalizeDialTarget(to) {
   return raw;
 }
 
-app.post('/api/twilio/voice', (req, res) => {
+app.post('/api/twilio/voice', verifyTwilioSignature, (req, res) => {
   const twiml  = new twilio.twiml.VoiceResponse();
   const from   = String(req.body.From ?? '');
   const to     = normalizeDialTarget(req.body.To);
@@ -559,7 +1081,7 @@ app.post('/api/twilio/voice', (req, res) => {
 
 // POST /api/twilio/transfer — transfer a live PSTN call to a SIP extension
 // Body: { callSid, extension }  e.g. { callSid: "CA...", extension: "1002" }
-app.post('/api/twilio/transfer', async (req, res) => {
+app.post('/api/twilio/transfer', requireAuth, async (req, res) => {
   const { callSid, extension } = req.body ?? {};
   if (!callSid || !extension) return res.status(400).json({ error: 'callSid and extension required' });
   const ext = String(extension).replace(/\D/g, '').slice(0, 6);
@@ -580,7 +1102,7 @@ app.post('/api/twilio/transfer', async (req, res) => {
 // Twilio POSTs form-encoded fields: CallSid, CallStatus, Direction, From, To, etc.
 // We acknowledge with 204 so Twilio stops retrying.  Extend here to persist
 // call records, push real-time updates via WebSocket, etc.
-app.post('/api/calls/status', (req, res) => {
+app.post('/api/calls/status', verifyTwilioSignature, (req, res) => {
   const { CallSid, CallStatus, Direction, From, To, CallDuration } = req.body ?? {};
   console.log(
     `[call-status] sid=${CallSid} status=${CallStatus} dir=${Direction} from=${From} to=${To} dur=${CallDuration ?? '–'}s`
@@ -590,7 +1112,7 @@ app.post('/api/calls/status', (req, res) => {
 
 // POST /api/twilio/outbound — TwiML App calls this for browser-initiated PSTN calls
 // Twilio passes the destination number as req.body.To
-app.post('/api/twilio/outbound', (req, res) => {
+app.post('/api/twilio/outbound', verifyTwilioSignature, (req, res) => {
   const to    = normalizeDialTarget(req.body.To);
   const twiml = new twilio.twiml.VoiceResponse();
 
@@ -622,7 +1144,7 @@ app.post('/api/twilio/outbound', (req, res) => {
 // POST /webhooks/voice/incoming
 // Called by Twilio when an inbound call arrives. Creates the call record and
 // presents the IVR menu.
-app.post('/webhooks/voice/incoming', async (req, res) => {
+app.post('/webhooks/voice/incoming', verifyTwilioSignature, async (req, res) => {
   const { CallSid, From } = req.body ?? {};
   const base = buildBaseUrl(req);
 
@@ -649,7 +1171,7 @@ app.post('/webhooks/voice/incoming', async (req, res) => {
 // POST /webhooks/voice/ivr?retries=N
 // Handles digit input (1/2/9), timeouts, and invalid keys.
 // Retries are tracked via the query param (max 3 before hanging up).
-app.post('/webhooks/voice/ivr', async (req, res) => {
+app.post('/webhooks/voice/ivr', verifyTwilioSignature, async (req, res) => {
   const { CallSid, Digits } = req.body ?? {};
   const retries = Math.min(parseInt(req.query.retries ?? '0', 10), 9);
   const base    = buildBaseUrl(req);
@@ -704,131 +1226,81 @@ app.post('/webhooks/voice/ivr', async (req, res) => {
   res.type('text/xml').send(twiml.toString());
 });
 
-// GET /webhooks/voice/hold-music
-// Conference waitUrl — returns TwiML that plays hold music on loop while
-// the caller waits for an agent to join.
-app.get('/webhooks/voice/hold-music', (_req, res) => {
-  const twiml = new twilio.twiml.VoiceResponse();
-  twiml.play({ loop: 99 },
-    'https://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3'
-  );
-  res.type('text/xml').send(twiml.toString());
-});
-
 // POST /webhooks/voice/connect-agent
-// Places the PSTN caller into a named conference room (with hold music),
-// then makes a Twilio REST outbound call to the browser softphone so the
-// agent can join the same room.  If the agent does not answer within 20 s,
-// agent-status redirects the waiting caller to the no-agent menu.
-app.post('/webhooks/voice/connect-agent', async (req, res) => {
+// Directly dials the agent's browser client and bridges it with the caller
+// using <Dial><Client> — no Twilio Conference room involved. The caller's
+// own call leg rings the agent leg directly; Twilio bridges the two legs
+// of the SAME <Dial> the moment the agent answers.
+app.post('/webhooks/voice/connect-agent', verifyTwilioSignature, async (req, res) => {
   const { CallSid } = req.body ?? {};
   const base = buildBaseUrl(req);
-  const conferenceName = `ivr_conf_${CallSid}`;
 
   await logIvrEvent(CallSid, 'agent_ringing');
 
-  // Look up the real caller's number so we can pass it through to the agent's
-  // browser — the REST call below rings the agent FROM our own Twilio number,
-  // so call.parameters['From'] on that leg would otherwise show our own
-  // number instead of the actual caller.
+  // Look up the real caller's number to pass through as a custom parameter —
+  // <Dial><Client> does carry the original caller ID by default, but we pass
+  // it explicitly too so the browser never has to guess.
   let realCaller = 'Unknown';
   try {
     const { rows } = await pool.query('SELECT remote_identity FROM call_logs WHERE id = $1', [CallSid]);
     if (rows[0]?.remote_identity) realCaller = rows[0].remote_identity;
   } catch (err) { console.error('[connect-agent] caller lookup:', err.message); }
 
-  // Ring the browser softphone via REST. On answer, agent-join TwiML places
-  // the agent into the conference. On no-answer/failure, agent-status
-  // redirects the waiting caller out of the conference hold.
-  // Query params on the client URI surface as call.customParameters in the
-  // Voice JS SDK — this is how we smuggle the real caller ID through.
-  if (twilioRest && TWILIO_PHONE_NUMBER) {
-    const clientParams = new URLSearchParams({ realCaller, realCallSid: CallSid });
-    twilioRest.calls.create({
-      to:     `client:softphone-1001?${clientParams.toString()}`,
-      from:   TWILIO_PHONE_NUMBER,
-      url:    `${base}/webhooks/voice/agent-join?conference=${encodeURIComponent(conferenceName)}&callerSid=${encodeURIComponent(CallSid)}`,
-      method: 'POST',
-      timeout: 20,
-      statusCallback:       `${base}/webhooks/voice/agent-status?callerSid=${encodeURIComponent(CallSid)}&base=${encodeURIComponent(base)}`,
-      statusCallbackMethod: 'POST',
-      statusCallbackEvent:  ['no-answer', 'busy', 'failed', 'canceled'],
-    }).catch((err) => console.error('[connect-agent] REST dial:', err.message));
-  } else {
-    console.warn('[connect-agent] twilioRest not configured — agent will not be rung');
-  }
-
-  // Caller waits in conference with hold music until agent joins.
-  // startConferenceOnEnter=false: conference has not started yet, caller hears waitUrl.
-  // endConferenceOnExit=true: conference ends if the caller hangs up.
   const twiml = new twilio.twiml.VoiceResponse();
-  twiml.say({ voice: 'alice' }, 'Please hold while we connect you to an agent.');
-  const dial = twiml.dial();
-  dial.conference(conferenceName, {
-    startConferenceOnEnter: 'false',
-    endConferenceOnExit:    'true',
-    waitUrl:    `${base}/webhooks/voice/hold-music`,
-    waitMethod: 'GET',
+  const dial = twiml.dial({
+    timeout: 20,
+    action:  `${base}/webhooks/voice/agent-dial-status`,
+    record:  'record-from-answer',
+    recordingStatusCallback:       `${base}/webhooks/voice/recording-complete`,
+    recordingStatusCallbackMethod: 'POST',
   });
+  // statusCallback on the <Client> noun fires the moment THIS leg is answered —
+  // lets us mark the call as answered without any conference bridging.
+  const client = dial.client({
+    statusCallback:       `${base}/webhooks/voice/agent-answered?callerSid=${encodeURIComponent(CallSid)}`,
+    statusCallbackEvent:  'answered',
+    statusCallbackMethod: 'POST',
+  }, 'softphone-1001');
+  client.parameter({ name: 'realCaller',  value: realCaller });
+  client.parameter({ name: 'realCallSid', value: CallSid });
 
   res.type('text/xml').send(twiml.toString());
 });
 
-// POST /webhooks/voice/agent-join?conference=...&callerSid=...
-// TwiML served to the browser agent when their outbound call connects.
-// Joining with startConferenceOnEnter=true starts the conference and
-// bridges the agent with the waiting PSTN caller.
-app.post('/webhooks/voice/agent-join', async (req, res) => {
-  const { CallSid } = req.body ?? {};
-  const conferenceName = decodeURIComponent(req.query.conference ?? '');
-  const callerSid      = decodeURIComponent(req.query.callerSid  ?? '');
-
-  await logIvrEvent(callerSid || CallSid, 'agent_answered');
+// POST /webhooks/voice/agent-answered?callerSid=...
+// Fired the instant the agent's client leg connects (statusCallbackEvent=answered).
+app.post('/webhooks/voice/agent-answered', verifyTwilioSignature, async (req, res) => {
+  const callerSid = decodeURIComponent(req.query.callerSid ?? '');
+  await logIvrEvent(callerSid, 'agent_answered');
   await pool.query(
     `UPDATE call_logs SET status = 'answered', ivr_completed = TRUE WHERE id = $1`,
     [callerSid]
   ).catch(() => {});
-
-  const twiml = new twilio.twiml.VoiceResponse();
-  const dial  = twiml.dial();
-  dial.conference(conferenceName, {
-    startConferenceOnEnter: 'true',   // starts the conference → caller and agent connected
-    endConferenceOnExit:    'true',   // conference ends when agent hangs up
-  });
-  res.type('text/xml').send(twiml.toString());
-});
-
-// POST /webhooks/voice/agent-status?callerSid=...&base=...
-// Twilio fires this when the outbound agent call ends without being answered
-// (no-answer / busy / failed / canceled).
-// Uses the REST API to redirect the waiting caller out of conference hold.
-app.post('/webhooks/voice/agent-status', async (req, res) => {
-  const callerSid  = decodeURIComponent(req.query.callerSid ?? '');
-  const base       = decodeURIComponent(req.query.base      ?? '');
-  const callStatus = req.body?.CallStatus ?? '';
-
-  if (callerSid && base && twilioRest) {
-    // 'canceled' means agent actively rejected the call → go straight to voicemail.
-    // 'no-answer'/'busy'/'failed' → offer retry or voicemail via agent-dial-status.
-    const target = callStatus === 'canceled'
-      ? `${base}/webhooks/voice/voicemail`
-      : `${base}/webhooks/voice/agent-dial-status`;
-    try {
-      await twilioRest.calls(callerSid).update({ url: target, method: 'POST' });
-    } catch (err) {
-      console.error('[agent-status] caller redirect failed:', err.message);
-    }
-  }
   res.status(204).end();
 });
 
 // POST /webhooks/voice/agent-dial-status
-// Reached when the agent did not answer (redirected here by agent-status).
-// Gives the caller the option to try again or leave a voicemail.
-app.post('/webhooks/voice/agent-dial-status', async (req, res) => {
-  const { CallSid } = req.body ?? {};
+// The <Dial> action callback — fires once the dial to the agent finishes,
+// whether answered-then-ended, or never answered.
+app.post('/webhooks/voice/agent-dial-status', verifyTwilioSignature, async (req, res) => {
+  const { CallSid, DialCallStatus } = req.body ?? {};
   const base = buildBaseUrl(req);
 
+  if (DialCallStatus === 'completed') {
+    // Agent answered and the call has now ended normally.
+    const twiml = new twilio.twiml.VoiceResponse();
+    twiml.hangup();
+    return res.type('text/xml').send(twiml.toString());
+  }
+
+  if (DialCallStatus === 'canceled') {
+    // Agent actively declined — go straight to voicemail.
+    const twiml = new twilio.twiml.VoiceResponse();
+    twiml.redirect({ method: 'POST' }, `${base}/webhooks/voice/voicemail`);
+    return res.type('text/xml').send(twiml.toString());
+  }
+
+  // no-answer / busy / failed → offer retry or voicemail.
   const twiml  = new twilio.twiml.VoiceResponse();
   const gather = twiml.gather({
     numDigits: '1',
@@ -848,7 +1320,7 @@ app.post('/webhooks/voice/agent-dial-status', async (req, res) => {
 
 // POST /webhooks/voice/no-agent-response
 // Handles the caller's choice after agent was unavailable.
-app.post('/webhooks/voice/no-agent-response', async (req, res) => {
+app.post('/webhooks/voice/no-agent-response', verifyTwilioSignature, async (req, res) => {
   const { CallSid, Digits } = req.body ?? {};
   const base = buildBaseUrl(req);
 
@@ -863,7 +1335,7 @@ app.post('/webhooks/voice/no-agent-response', async (req, res) => {
 
 // POST /webhooks/voice/voicemail
 // Prompts the caller to leave a message and starts recording.
-app.post('/webhooks/voice/voicemail', async (req, res) => {
+app.post('/webhooks/voice/voicemail', verifyTwilioSignature, async (req, res) => {
   const { CallSid } = req.body ?? {};
   const base = buildBaseUrl(req);
 
@@ -887,7 +1359,7 @@ app.post('/webhooks/voice/voicemail', async (req, res) => {
 
 // POST /webhooks/voice/voicemail-complete
 // Twilio posts here after the recording ends. Saves the voicemail to DB.
-app.post('/webhooks/voice/voicemail-complete', async (req, res) => {
+app.post('/webhooks/voice/voicemail-complete', verifyTwilioSignature, async (req, res) => {
   const {
     CallSid,
     From,
@@ -931,7 +1403,7 @@ app.post('/webhooks/voice/voicemail-complete', async (req, res) => {
 
 // POST /webhooks/voice/transcription-callback
 // Twilio fires this when the transcription of a voicemail is ready.
-app.post('/webhooks/voice/transcription-callback', async (req, res) => {
+app.post('/webhooks/voice/transcription-callback', verifyTwilioSignature, async (req, res) => {
   const {
     CallSid,
     TranscriptionStatus,
@@ -959,7 +1431,7 @@ app.post('/webhooks/voice/transcription-callback', async (req, res) => {
 // POST /webhooks/voice/recording-complete
 // Twilio fires this when a call recording is ready. Stores the RecordingSid
 // on the call_log row so the UI can play it back via /api/recordings/:sid.
-app.post('/webhooks/voice/recording-complete', async (req, res) => {
+app.post('/webhooks/voice/recording-complete', verifyTwilioSignature, async (req, res) => {
   const { CallSid, RecordingSid, RecordingDuration } = req.body ?? {};
   console.log(`[recording-complete] call=${CallSid} recording=${RecordingSid} dur=${RecordingDuration}s`);
   if (CallSid && RecordingSid) {
@@ -973,7 +1445,7 @@ app.post('/webhooks/voice/recording-complete', async (req, res) => {
 
 // POST /webhooks/voice/caller-hangup
 // Optional status callback to mark calls as completed in DB.
-app.post('/webhooks/voice/caller-hangup', async (req, res) => {
+app.post('/webhooks/voice/caller-hangup', verifyTwilioSignature, async (req, res) => {
   const { CallSid, CallStatus, CallDuration } = req.body ?? {};
   await logIvrEvent(CallSid, 'caller_hangup');
   await pool.query(

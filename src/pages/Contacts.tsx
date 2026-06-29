@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import type { Contact } from '../types/sip';
+import type { Contact, ExtensionDirectoryEntry } from '../types/sip';
 
 type FormState = { name: string; extension: string };
 const emptyForm: FormState = { name: '', extension: '' };
@@ -21,9 +21,16 @@ const AVATAR_COLORS = ['#2563eb','#7c3aed','#db2777','#059669','#d97706','#0891b
 function avatarColor(id: number) { return AVATAR_COLORS[id % AVATAR_COLORS.length]; }
 
 export function Contacts({ onCall }: { onCall: (ext: string) => void }) {
+  const [tab, setTab] = useState<'contacts' | 'extensions'>('contacts');
+
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [loading, setLoading]   = useState(true);
   const [error, setError]       = useState<string | null>(null);
+
+  const [directory, setDirectory]               = useState<ExtensionDirectoryEntry[]>([]);
+  const [directoryLoaded, setDirectoryLoaded]    = useState(false);
+  const [directoryLoading, setDirectoryLoading]  = useState(false);
+  const [directoryError, setDirectoryError]      = useState<string | null>(null);
 
   const [showModal, setShowModal]     = useState(false);
   const [editContact, setEditContact] = useState<Contact | null>(null);
@@ -36,6 +43,10 @@ export function Contacts({ onCall }: { onCall: (ext: string) => void }) {
 
   useEffect(() => { loadContacts(); }, []);
 
+  useEffect(() => {
+    if (tab === 'extensions' && !directoryLoaded) loadDirectory();
+  }, [tab, directoryLoaded]); // eslint-disable-line react-hooks/exhaustive-deps
+
   async function loadContacts() {
     setLoading(true); setError(null);
     try {
@@ -43,6 +54,16 @@ export function Contacts({ onCall }: { onCall: (ext: string) => void }) {
     } catch (e: unknown) {
       setError((e as Error).message);
     } finally { setLoading(false); }
+  }
+
+  async function loadDirectory() {
+    setDirectoryLoading(true); setDirectoryError(null);
+    try {
+      setDirectory(await apiFetch<ExtensionDirectoryEntry[]>('/api/extensions/directory'));
+      setDirectoryLoaded(true);
+    } catch (e: unknown) {
+      setDirectoryError((e as Error).message);
+    } finally { setDirectoryLoading(false); }
   }
 
   function openAdd() {
@@ -90,69 +111,144 @@ export function Contacts({ onCall }: { onCall: (ext: string) => void }) {
 
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
         <div>
           <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700, color: 'var(--text-primary)' }}>Contacts</h2>
-          {!loading && <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 2 }}>{contacts.length} contact{contacts.length !== 1 ? 's' : ''}</div>}
+          {tab === 'contacts' && !loading && <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 2 }}>{contacts.length} contact{contacts.length !== 1 ? 's' : ''}</div>}
+          {tab === 'extensions' && !directoryLoading && <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 2 }}>{directory.length} extension{directory.length !== 1 ? 's' : ''}</div>}
         </div>
-        <button onClick={openAdd} style={primaryBtn}>+ Add Contact</button>
+        {tab === 'contacts' && <button onClick={openAdd} style={primaryBtn}>+ Add Contact</button>}
       </div>
 
-      {loading && <div style={{ color: 'var(--text-muted)', fontSize: 14 }}>Loading\u2026</div>}
-      {error && <div style={errorBlock}>Error: {error}</div>}
-
-      {!loading && !error && contacts.length === 0 && (
-        <div style={emptyState}>
-          <div style={{ fontSize: 32, marginBottom: 10, opacity: 0.25 }}>&#9993;</div>
-          <div style={{ color: 'var(--text-muted)', fontSize: 14 }}>No contacts yet. Click &ldquo;+ Add Contact&rdquo; to create one.</div>
-        </div>
-      )}
-
-      <div style={{
-        background: 'var(--surface)',
-        borderRadius: 'var(--radius-lg)',
-        border: contacts.length ? '1px solid var(--border)' : 'none',
-        boxShadow: contacts.length ? 'var(--shadow-sm)' : 'none',
-        overflow: 'hidden',
-      }}>
-        {contacts.map((c, idx) => (
-          <div
-            key={c.id}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 20, borderBottom: '1px solid var(--border)' }}>
+        {([
+          { key: 'contacts', label: 'Contacts' },
+          { key: 'extensions', label: 'SIP Extensions' },
+        ] as const).map(({ key, label }) => (
+          <button
+            key={key}
+            onClick={() => setTab(key)}
             style={{
-              display: 'flex', alignItems: 'center',
-              padding: '14px 18px',
-              borderBottom: idx < contacts.length - 1 ? '1px solid var(--border-light)' : 'none',
-              transition: 'background 0.1s',
+              padding: '9px 16px', background: 'transparent', cursor: 'pointer',
+              border: 'none', borderBottom: tab === key ? '2px solid var(--blue)' : '2px solid transparent',
+              marginBottom: -1, fontSize: 13, fontWeight: 600,
+              color: tab === key ? 'var(--blue)' : 'var(--text-muted)',
             }}
-            onMouseEnter={(e) => (e.currentTarget.style.background = '#fafafa')}
-            onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
           >
-            {/* Avatar */}
-            <div style={{
-              width: 38, height: 38, borderRadius: '50%',
-              background: avatarColor(c.id),
-              color: '#fff', fontWeight: 700, fontSize: 13,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              flexShrink: 0, marginRight: 14, letterSpacing: '0.02em',
-            }}>
-              {initials(c.name)}
-            </div>
-
-            {/* Info */}
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontWeight: 600, color: 'var(--text-primary)', fontSize: 14 }}>{c.name}</div>
-              <div style={{ fontSize: 12, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', marginTop: 1 }}>{c.extension}</div>
-            </div>
-
-            {/* Actions */}
-            <div style={{ display: 'flex', gap: 6, flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-              <button onClick={() => onCall(c.extension)} style={callBtn}>Call</button>
-              <button onClick={() => openEdit(c)} style={ghostBtn}>Edit</button>
-              <button onClick={() => setDeleteTarget(c)} style={dangerGhostBtn}>Delete</button>
-            </div>
-          </div>
+            {label}
+          </button>
         ))}
       </div>
+
+      {tab === 'contacts' && (
+        <>
+          {loading && <div style={{ color: 'var(--text-muted)', fontSize: 14 }}>Loading\u2026</div>}
+          {error && <div style={errorBlock}>Error: {error}</div>}
+
+          {!loading && !error && contacts.length === 0 && (
+            <div style={emptyState}>
+              <div style={{ fontSize: 32, marginBottom: 10, opacity: 0.25 }}>&#9993;</div>
+              <div style={{ color: 'var(--text-muted)', fontSize: 14 }}>No contacts yet. Click &ldquo;+ Add Contact&rdquo; to create one.</div>
+            </div>
+          )}
+
+          <div style={{
+            background: 'var(--surface)',
+            borderRadius: 'var(--radius-lg)',
+            border: contacts.length ? '1px solid var(--border)' : 'none',
+            boxShadow: contacts.length ? 'var(--shadow-sm)' : 'none',
+            overflow: 'hidden',
+          }}>
+            {contacts.map((c, idx) => (
+              <div
+                key={c.id}
+                style={{
+                  display: 'flex', alignItems: 'center',
+                  padding: '14px 18px',
+                  borderBottom: idx < contacts.length - 1 ? '1px solid var(--border-light)' : 'none',
+                  transition: 'background 0.1s',
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = '#fafafa')}
+                onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+              >
+                {/* Avatar */}
+                <div style={{
+                  width: 38, height: 38, borderRadius: '50%',
+                  background: avatarColor(c.id),
+                  color: '#fff', fontWeight: 700, fontSize: 13,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  flexShrink: 0, marginRight: 14, letterSpacing: '0.02em',
+                }}>
+                  {initials(c.name)}
+                </div>
+
+                {/* Info */}
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontWeight: 600, color: 'var(--text-primary)', fontSize: 14 }}>{c.name}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', marginTop: 1 }}>{c.extension}</div>
+                </div>
+
+                {/* Actions */}
+                <div style={{ display: 'flex', gap: 6, flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                  <button onClick={() => onCall(c.extension)} style={callBtn}>Call</button>
+                  <button onClick={() => openEdit(c)} style={ghostBtn}>Edit</button>
+                  <button onClick={() => setDeleteTarget(c)} style={dangerGhostBtn}>Delete</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {tab === 'extensions' && (
+        <>
+          {directoryLoading && <div style={{ color: 'var(--text-muted)', fontSize: 14 }}>Loading\u2026</div>}
+          {directoryError && <div style={errorBlock}>Error: {directoryError}</div>}
+
+          {!directoryLoading && !directoryError && directory.length === 0 && (
+            <div style={emptyState}>
+              <div style={{ fontSize: 32, marginBottom: 10, opacity: 0.25 }}>&#9742;</div>
+              <div style={{ color: 'var(--text-muted)', fontSize: 14 }}>No SIP extensions provisioned yet.</div>
+            </div>
+          )}
+
+          {!directoryLoading && !directoryError && directory.length > 0 && (
+            <div style={{
+              background: 'var(--surface)', borderRadius: 'var(--radius-lg)',
+              border: '1px solid var(--border)', boxShadow: 'var(--shadow-sm)', overflow: 'hidden',
+            }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <thead>
+                  <tr style={{ background: 'var(--border-light)', borderBottom: '1px solid var(--border)' }}>
+                    {['Extension', 'Assigned To', ''].map((h, i) => (
+                      <th key={i} style={{ padding: '10px 16px', textAlign: 'left', fontWeight: 600, fontSize: 11, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--text-muted)' }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {directory.map((d, idx) => (
+                    <tr key={d.extension} style={{ borderBottom: idx < directory.length - 1 ? '1px solid var(--border-light)' : 'none' }}>
+                      <td style={{ padding: '12px 16px', fontFamily: 'var(--font-mono)', fontWeight: 700, color: 'var(--text-primary)' }}>
+                        {d.extension}
+                      </td>
+                      <td style={{ padding: '12px 16px' }}>
+                        {d.assignedTo ? (
+                          <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{d.assignedTo}</span>
+                        ) : (
+                          <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>Unassigned</span>
+                        )}
+                      </td>
+                      <td style={{ padding: '12px 16px', textAlign: 'right' }}>
+                        <button onClick={() => onCall(d.extension)} style={callBtn}>Call</button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
 
       {/* Add / Edit Modal */}
       {showModal && (

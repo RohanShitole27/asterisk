@@ -6,7 +6,7 @@ import { useContacts } from '../hooks/useContacts';
 type AsteriskAPI = ReturnType<typeof useAsteriskPhone>;
 type TwilioAPI   = ReturnType<typeof useTwilioPhone>;
 
-interface Props { asterisk: AsteriskAPI; twilio: TwilioAPI; }
+interface Props { asterisk: AsteriskAPI; twilio: TwilioAPI; pstnEnabled: boolean; }
 
 const KEYS = [
   { digit: '1', sub: '' },
@@ -76,7 +76,7 @@ function SignalBars({ quality }: { quality: number }) {
   );
 }
 
-export function Softphone({ asterisk, twilio }: Props) {
+export function Softphone({ asterisk, twilio, pstnEnabled }: Props) {
   const { lookupName } = useContacts();
   const [input, setInput]       = useState('');
   const [addInput, setAddInput]         = useState('');
@@ -148,12 +148,14 @@ export function Softphone({ asterisk, twilio }: Props) {
     const n = input.trim();
     if (!n) return;
     const digits = n.replace(/\D/g, '');
-    if (digits.length >= 10) twilio.makeCall(n);
-    else                     asterisk.makeCall(n);
+    if (digits.length >= 10 && pstnEnabled) twilio.makeCall(n);
+    else if (digits.length < 10)            asterisk.makeCall(n);
+    // 10+ digit number but PSTN disabled for this role — no-op rather than
+    // attempting a call through a Device that was never registered.
     setInput('');
   };
 
-  const canCall = (asterisk.state.registered || twilio.state.ready) && !inCall && input.trim();
+  const canCall = (asterisk.state.registered || (pstnEnabled && twilio.state.ready)) && !inCall && input.trim();
 
   const getStatusLabel = () => {
     if (callStatus === 'ringing')  return 'Ringing…';
@@ -556,7 +558,7 @@ export function Softphone({ asterisk, twilio }: Props) {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && dial()}
-                placeholder="Enter number or extension"
+                placeholder={pstnEnabled ? 'Enter number or extension' : 'Enter extension (SIP only)'}
                 style={{
                   width: '100%', padding: '14px 48px 14px 18px',
                   fontSize: 20, textAlign: 'center',
@@ -635,8 +637,12 @@ export function Softphone({ asterisk, twilio }: Props) {
         fontSize: 11, color: 'rgba(255,255,255,0.25)', flexWrap: 'wrap',
       }}>
         <span>SIP ext → Asterisk</span>
-        <span>·</span>
-        <span>10-digit → Twilio PSTN</span>
+        {pstnEnabled && (
+          <>
+            <span>·</span>
+            <span>10-digit → Twilio PSTN</span>
+          </>
+        )}
         <span>·</span>
         <span>Conference: SIP only</span>
       </div>

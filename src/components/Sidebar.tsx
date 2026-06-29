@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import type { CallStatus } from '../types/sip';
+import type { CallStatus, User, UserRole } from '../types/sip';
 
-type Page = 'dashboard' | 'softphone' | 'logs' | 'contacts' | 'voicemail';
+type Page = 'dashboard' | 'softphone' | 'logs' | 'contacts' | 'voicemail' | 'users';
 
 interface SidebarProps {
   currentPage:      Page;
@@ -12,21 +12,26 @@ interface SidebarProps {
   callStatus:       CallStatus;
   unreadVoicemails: number;
   isMobile:         boolean;
+  user:             User;
+  onLogout:         () => void;
 }
 
-const NAV: { key: Page; label: string; icon: string }[] = [
+const NAV: { key: Page; label: string; icon: string; visibleFor?: UserRole[] }[] = [
   { key: 'dashboard', label: 'Dashboard',  icon: '▦' },
   { key: 'logs',      label: 'Call Logs',  icon: '≡' },
   { key: 'voicemail', label: 'Voicemails', icon: '▶' },
   { key: 'contacts',  label: 'Contacts',   icon: '◎' },
   { key: 'softphone', label: 'Softphone',  icon: '⌨' },
+  { key: 'users',      label: 'Users',      icon: '👤', visibleFor: ['admin'] },
 ];
 
 export function Sidebar({
   currentPage, onNavigate,
   registered, registering, twilioReady,
   callStatus, unreadVoicemails, isMobile,
+  user, onLogout,
 }: SidebarProps) {
+  const nav = NAV.filter((n) => !n.visibleFor || n.visibleFor.includes(user.role));
   const sipColor = registered ? '#4ade80' : registering ? '#fbbf24' : '#f87171';
   const sipLabel =
     callStatus !== 'idle'
@@ -42,21 +47,49 @@ export function Sidebar({
     return () => clearInterval(id);
   }, [callStatus]);
 
-  // ── Mobile: bottom tab bar ──────────────────────────────────────────────────
+  // ── Mobile: top bar (user + logout) + bottom tab bar ────────────────────────
   if (isMobile) {
     return (
-      <nav style={{
-        position: 'fixed',
-        bottom: 0, left: 0, right: 0,
-        height: 64,
-        background: '#0f172a',
-        borderTop: '1px solid rgba(255,255,255,0.07)',
-        display: 'flex',
-        alignItems: 'stretch',
-        zIndex: 100,
-        paddingBottom: 'env(safe-area-inset-bottom)',
-      }}>
-        {NAV.map(({ key, label, icon }) => {
+      <>
+        <div style={{
+          position: 'fixed', top: 0, left: 0, right: 0, height: 48,
+          background: '#0f172a', borderBottom: '1px solid rgba(255,255,255,0.07)',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: '0 14px', zIndex: 100,
+          paddingTop: 'env(safe-area-inset-top)',
+        }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: '#f1f5f9', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {user.name}
+            </div>
+            <div style={{ fontSize: 10, color: 'var(--sidebar-muted)' }}>
+              {user.role.charAt(0).toUpperCase() + user.role.slice(1)}{user.extension ? ` · ext ${user.extension}` : ''}
+            </div>
+          </div>
+          <button
+            onClick={onLogout}
+            style={{
+              flexShrink: 0, padding: '6px 12px', fontSize: 11, fontWeight: 600,
+              background: 'rgba(255,255,255,0.06)', border: '1px solid var(--sidebar-border)',
+              borderRadius: 6, color: 'var(--sidebar-muted)', cursor: 'pointer',
+            }}
+          >
+            Log Out
+          </button>
+        </div>
+
+        <nav style={{
+          position: 'fixed',
+          bottom: 0, left: 0, right: 0,
+          height: 64,
+          background: '#0f172a',
+          borderTop: '1px solid rgba(255,255,255,0.07)',
+          display: 'flex',
+          alignItems: 'stretch',
+          zIndex: 100,
+          paddingBottom: 'env(safe-area-inset-bottom)',
+        }}>
+        {nav.map(({ key, label, icon }) => {
           const isActive  = currentPage === key;
           const isRinging = key === 'softphone' && callStatus === 'incoming';
           return (
@@ -123,7 +156,8 @@ export function Sidebar({
             </button>
           );
         })}
-      </nav>
+        </nav>
+      </>
     );
   }
 
@@ -164,7 +198,7 @@ export function Sidebar({
 
       {/* Nav */}
       <div style={{ flex: 1, padding: '10px 0' }}>
-        {NAV.map(({ key, label, icon }) => {
+        {nav.map(({ key, label, icon }) => {
           const isActive  = currentPage === key;
           const isRinging = key === 'softphone' && callStatus === 'incoming';
           return (
@@ -211,9 +245,22 @@ export function Sidebar({
       {/* Footer */}
       <div style={{
         padding: '12px 20px', borderTop: '1px solid var(--sidebar-border)',
-        fontSize: 11, color: 'var(--sidebar-muted)', lineHeight: 1.6,
       }}>
-        ext 1001 &middot; 127.0.0.1:8089
+        <div style={{ fontSize: 12, fontWeight: 600, color: '#f1f5f9', marginBottom: 1 }}>{user.name}</div>
+        <div style={{ fontSize: 11, color: 'var(--sidebar-muted)', marginBottom: 8 }}>
+          {user.role.charAt(0).toUpperCase() + user.role.slice(1)}
+          {user.extension ? ` · ext ${user.extension}` : ''}
+        </div>
+        <button
+          onClick={onLogout}
+          style={{
+            width: '100%', padding: '6px 0', fontSize: 11, fontWeight: 600,
+            background: 'transparent', border: '1px solid var(--sidebar-border)',
+            borderRadius: 6, color: 'var(--sidebar-muted)', cursor: 'pointer',
+          }}
+        >
+          Log Out
+        </button>
       </div>
     </nav>
   );

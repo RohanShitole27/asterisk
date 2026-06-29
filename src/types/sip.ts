@@ -23,6 +23,7 @@ export interface CallLogEntry {
   ivrCompleted?: boolean;
   recordingSid?: string | null;      // Twilio PSTN recording
   sipRecordingFile?: string | null;  // Asterisk SIP recording filename
+  extension?: string | null;         // which extension/agent handled this call
 }
 
 export interface IvrEvent {
@@ -37,4 +38,21 @@ export interface Contact {
   id: number;
   name: string;
   extension: string;
+}
+
+export interface ExtensionDirectoryEntry {
+  extension: string;
+  assignedTo: string | null;
+}
+
+export type UserRole = 'admin' | 'manager' | 'agent';
+
+export interface User {
+  id: number;
+  name: string;
+  email: string;
+  role: UserRole;
+  extension: string | null;
+  isActive: boolean;
+  managerId: number | null;
 }
